@@ -1,0 +1,48 @@
+name: Music Chart Heartbeat
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub cron uses UTC. Minute 17 avoids the busiest exact-hour window.
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: music-chart-heartbeat
+  cancel-in-progress: false
+
+env:
+  RUN_DAYS: "7"
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Collect music charts
+        run: python scripts/collect_music_charts.py
+
+      - name: Commit updated data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add data outputs
+          if git diff --cached --quiet; then
+            echo "No data changes to commit."
+          else
+            git commit -m "chore: hourly music chart snapshot"
+            git pull --rebase
+            git push
+          fi
