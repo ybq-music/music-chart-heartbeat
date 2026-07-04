@@ -1,0 +1,2 @@
+﻿snapshot_date,status,row_count,xlsx_path,completed_at,message
+2026-07-04,complete,800,/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-07-04.xlsx,2026-07-05T01:12:51+08:00,2026-07-04 完成，生成 music_charts_2026-07-04.xlsx，共 800 行。
