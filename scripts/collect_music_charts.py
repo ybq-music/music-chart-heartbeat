@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -394,6 +395,31 @@ def collect_chart(source: ChartSource, snapshot_date: str, captured_at: str) -> 
     raise RuntimeError(f"未知榜单类型：{source.kind}")
 
 
+def official_snapshot_date(rows: list[dict], fallback_date: str) -> str:
+    dates_by_chart: dict[tuple[str, str], set[str]] = defaultdict(set)
+    for row in rows:
+        platform_date = str(row.get("platform_date", "")).strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", platform_date):
+            dates_by_chart[(row["platform"], row["chart"])].add(platform_date)
+
+    if not dates_by_chart:
+        return fallback_date
+
+    all_dates = sorted({date_value for values in dates_by_chart.values() for date_value in values})
+    if len(all_dates) == 1:
+        return all_dates[0]
+
+    parts = []
+    for (platform, chart), date_values in sorted(dates_by_chart.items()):
+        parts.append(f"{platform}-{chart}: {', '.join(sorted(date_values))}")
+    raise RuntimeError("四个榜单的平台显示日期不一致，等待后续候补触发重试：" + "；".join(parts))
+
+
+def replace_snapshot_date(rows: list[dict], snapshot_date: str) -> None:
+    for row in rows:
+        row["snapshot_date"] = snapshot_date
+
+
 def col_name(index: int) -> str:
     name = ""
     index += 1
@@ -745,11 +771,6 @@ def main() -> int:
         print("已完成目标天数，本次跳过。")
         return 0
 
-    if is_day_complete(snapshot_date):
-        write_run_status(config, f"{snapshot_date} 已经有完整表格，本次候补触发自动跳过。")
-        print(f"{snapshot_date} 已完成，本次跳过。")
-        return 0
-
     all_rows: list[dict] = []
     heartbeats: list[dict] = []
 
@@ -781,10 +802,10 @@ def main() -> int:
                 }
             )
 
-    append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
     success_count = sum(1 for row in heartbeats if row["status"] == "success")
 
     if success_count != len(CHARTS):
+        append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
         message = f"{snapshot_date} 本次只成功 {success_count}/{len(CHARTS)} 个榜单，等待后续候补触发重试。"
         upsert_daily_status(
             {
@@ -802,6 +823,7 @@ def main() -> int:
 
     expected_total = sum(source.expected_rows for source in CHARTS)
     if len(all_rows) != expected_total:
+        append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
         message = f"{snapshot_date} 行数异常：实际 {len(all_rows)}，预期 {expected_total}。"
         upsert_daily_status(
             {
@@ -817,6 +839,35 @@ def main() -> int:
         print(message)
         return 1
 
+    try:
+        snapshot_date = official_snapshot_date(all_rows, snapshot_date)
+    except Exception as exc:
+        append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
+        message = str(exc)[:500]
+        upsert_daily_status(
+            {
+                "snapshot_date": today.isoformat(),
+                "status": "failed",
+                "row_count": str(len(all_rows)),
+                "xlsx_path": "",
+                "completed_at": "",
+                "message": message,
+            }
+        )
+        write_run_status(config, message)
+        print(message)
+        return 1
+
+    replace_snapshot_date(all_rows, snapshot_date)
+    replace_snapshot_date(heartbeats, snapshot_date)
+
+    if is_day_complete(snapshot_date):
+        append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
+        write_run_status(config, f"{snapshot_date} 已经有完整表格，本次候补触发自动跳过。")
+        print(f"{snapshot_date} 已完成，本次跳过。")
+        return 0
+
+    append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
     detail_csv = DATA_DIR / f"daily_rows_{snapshot_date}.csv"
     write_csv(detail_csv, DETAIL_FIELDS, all_rows)
     output_path = build_daily_workbook(snapshot_date, captured_at, all_rows)
