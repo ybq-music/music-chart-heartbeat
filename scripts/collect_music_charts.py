@@ -8,10 +8,11 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 import urllib.request
 import zipfile
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Iterable
 from xml.sax.saxutils import escape
@@ -21,19 +22,18 @@ from zoneinfo import ZoneInfo
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 OUTPUT_DIR = ROOT / "outputs"
-CONFIG_PATH = DATA_DIR / "run_config.json"
-ROWS_CSV = DATA_DIR / "chart_rows.csv"
-HEARTBEAT_CSV = DATA_DIR / "chart_heartbeat.csv"
-WORKBOOK_PATH = OUTPUT_DIR / "music_chart_heartbeat.xlsx"
-TZ = ZoneInfo("Asia/Shanghai")
+CONFIG_PATH = DATA_DIR / "daily_run_config.json"
+HEARTBEAT_CSV = DATA_DIR / "daily_heartbeat.csv"
+DAILY_STATUS_CSV = DATA_DIR / "daily_status.csv"
+RUN_STATUS_MD = ROOT / "RUN_STATUS.md"
 
-RUN_DAYS = int(os.getenv("RUN_DAYS", "7"))
+TZ = ZoneInfo("Asia/Shanghai")
+TARGET_DAYS = int(os.getenv("TARGET_DAYS", "7"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
 
 
-ROW_FIELDS = [
-    "snapshot_id",
-    "scheduled_at",
+DETAIL_FIELDS = [
+    "snapshot_date",
     "captured_at",
     "platform",
     "chart",
@@ -51,15 +51,24 @@ ROW_FIELDS = [
 
 HEARTBEAT_FIELDS = [
     "run_id",
-    "scheduled_at",
+    "snapshot_date",
+    "status",
     "platform",
     "chart",
     "official_chart",
-    "status",
     "row_count",
     "started_at",
     "finished_at",
     "error_message",
+]
+
+DAILY_STATUS_FIELDS = [
+    "snapshot_date",
+    "status",
+    "row_count",
+    "xlsx_path",
+    "completed_at",
+    "message",
 ]
 
 
@@ -70,8 +79,9 @@ class ChartSource:
     official_chart: str
     kind: str
     url: str
-    rank_id: str = ""
-    note: str = ""
+    rank_id: str
+    expected_rows: int
+    note: str
 
 
 CHARTS = [
@@ -80,16 +90,20 @@ CHARTS = [
         chart="热歌榜",
         official_chart="热歌榜",
         kind="qq",
+        rank_id="26",
+        expected_rows=100,
         url="https://y.qq.com/n/ryqq/toplist/26",
-        note="QQ音乐公开网页榜单当前展示20条。",
+        note="QQ音乐热歌榜，取公开榜单接口前100名。",
     ),
     ChartSource(
         platform="QQ音乐",
         chart="飙升榜",
         official_chart="飙升榜",
         kind="qq",
+        rank_id="62",
+        expected_rows=100,
         url="https://y.qq.com/n/ryqq/toplist/62",
-        note="QQ音乐公开网页榜单当前展示20条。",
+        note="QQ音乐飙升榜，取公开榜单接口前100名。",
     ),
     ChartSource(
         platform="酷狗音乐",
@@ -97,8 +111,9 @@ CHARTS = [
         official_chart="酷狗TOP500",
         kind="kugou",
         rank_id="8888",
+        expected_rows=500,
         url="https://www.kugou.com/yy/rank/home/1-8888.html?from=rank",
-        note="酷狗公开榜单没有直接命名为“热歌榜”的入口，本任务采用官方“酷狗TOP500”作为热歌榜口径。",
+        note="酷狗没有直接命名为热歌榜的入口，本任务采用官方酷狗TOP500作为热歌榜口径。",
     ),
     ChartSource(
         platform="酷狗音乐",
@@ -106,8 +121,9 @@ CHARTS = [
         official_chart="酷狗飙升榜",
         kind="kugou",
         rank_id="6666",
+        expected_rows=100,
         url="https://www.kugou.com/yy/rank/home/1-6666.html?from=rank",
-        note="酷狗飙升榜按分页抓取。",
+        note="酷狗飙升榜，按公开榜单分页抓取。",
     ),
 ]
 
@@ -125,17 +141,16 @@ def ensure_dirs() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def load_or_create_config(started_at: datetime) -> dict:
+def load_or_create_config(today: date) -> dict:
     ensure_dirs()
     if CONFIG_PATH.exists():
         return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
-    ends_at = started_at + timedelta(days=RUN_DAYS)
     config = {
         "timezone": "Asia/Shanghai",
-        "run_days": RUN_DAYS,
-        "started_at": iso(started_at),
-        "ends_at": iso(ends_at),
+        "target_days": TARGET_DAYS,
+        "started_on": today.isoformat(),
+        "created_at": iso(now_local()),
     }
     CONFIG_PATH.write_text(
         json.dumps(config, ensure_ascii=False, indent=2),
@@ -149,10 +164,10 @@ def fetch_text(url: str) -> str:
         url,
         headers={
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+            "Referer": "https://y.qq.com/",
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/126.0 Safari/537.36"
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
             ),
         },
     )
@@ -167,144 +182,6 @@ def fetch_text(url: str) -> str:
             if attempt < 3:
                 time.sleep(attempt * 2)
     raise RuntimeError(f"请求失败：{url}；原因：{last_error}")
-
-
-def extract_platform_date(page: str) -> str:
-    qq_match = re.search(r'toplist_switch__data">([^<]+)<', page)
-    if qq_match:
-        return html.unescape(qq_match.group(1)).strip()
-
-    kugou_match = re.search(r"榜单更新于：([0-9-]+)", page)
-    if kugou_match:
-        return kugou_match.group(1)
-
-    return ""
-
-
-def qq_metric(rank_type: int | None, rank_value: str) -> str:
-    if rank_type == 1:
-        return f"上升 {rank_value}".strip()
-    if rank_type == 2:
-        return f"下降 {rank_value}".strip()
-    if rank_type == 4:
-        return "新进"
-    if rank_type == 6:
-        return f"热度 {rank_value}".strip()
-    return rank_value
-
-
-def collect_qq(source: ChartSource, scheduled_at: str, captured_at: str) -> list[dict]:
-    page = fetch_text(source.url)
-    platform_date = extract_platform_date(page)
-    match = re.search(r'"rankList":(\[.*?\]),"historyarr"', page, re.S)
-    if not match:
-        raise RuntimeError("未找到 QQ 音乐 rankList 数据")
-
-    rank_list = json.loads(match.group(1))
-    rows = []
-    snapshot_id = snapshot_key(scheduled_at, source)
-    for item in rank_list:
-        rows.append(
-            {
-                "snapshot_id": snapshot_id,
-                "scheduled_at": scheduled_at,
-                "captured_at": captured_at,
-                "platform": source.platform,
-                "chart": source.chart,
-                "official_chart": source.official_chart,
-                "platform_date": platform_date,
-                "rank": str(item.get("rank", "")),
-                "song_name": html.unescape(str(item.get("title", ""))).strip(),
-                "artist": html.unescape(str(item.get("singerName", ""))).strip(),
-                "chart_metric": qq_metric(item.get("rankType"), str(item.get("rankValue", ""))),
-                "duration": "",
-                "song_id": str(item.get("songId", "")),
-                "album_id": str(item.get("albumMid", "")),
-                "source_url": source.url,
-            }
-        )
-    return rows
-
-
-def kugou_page_url(rank_id: str, page_num: int) -> str:
-    return f"https://www.kugou.com/yy/rank/home/{page_num}-{rank_id}.html?from=rank"
-
-
-def extract_kugou_features(page: str) -> list[dict]:
-    match = re.search(r"global\.features\s*=\s*(\[.*?\]);", page, re.S)
-    if not match:
-        raise RuntimeError("未找到酷狗 global.features 数据")
-    return json.loads(match.group(1))
-
-
-def extract_kugou_page_info(page: str) -> tuple[int, int]:
-    total = int(re.search(r"total:\s*'([0-9]+)'", page).group(1))
-    page_size = int(re.search(r"pagesize:\s*'([0-9]+)'", page).group(1))
-    return total, page_size
-
-
-def split_kugou_name(file_name: str, fallback_artist: str) -> tuple[str, str]:
-    decoded = html.unescape(file_name).strip()
-    if " - " not in decoded:
-        return html.unescape(fallback_artist).strip(), decoded
-    artist, title = decoded.split(" - ", 1)
-    return artist.strip(), title.strip()
-
-
-def seconds_to_duration(value: object) -> str:
-    try:
-        seconds = int(round(float(value)))
-    except (TypeError, ValueError):
-        return ""
-    return f"{seconds // 60}:{seconds % 60:02d}"
-
-
-def collect_kugou(source: ChartSource, scheduled_at: str, captured_at: str) -> list[dict]:
-    first_page = fetch_text(source.url)
-    platform_date = extract_platform_date(first_page)
-    total, page_size = extract_kugou_page_info(first_page)
-    page_count = max(1, math.ceil(total / page_size))
-    rows: list[dict] = []
-    snapshot_id = snapshot_key(scheduled_at, source)
-
-    for page_num in range(1, page_count + 1):
-        page_url = kugou_page_url(source.rank_id, page_num)
-        page = first_page if page_num == 1 else fetch_text(page_url)
-        features = extract_kugou_features(page)
-
-        for index, item in enumerate(features, start=1):
-            artist, song_name = split_kugou_name(
-                str(item.get("FileName", "")),
-                str(item.get("author_name", "")),
-            )
-            rows.append(
-                {
-                    "snapshot_id": snapshot_id,
-                    "scheduled_at": scheduled_at,
-                    "captured_at": captured_at,
-                    "platform": source.platform,
-                    "chart": source.chart,
-                    "official_chart": source.official_chart,
-                    "platform_date": platform_date,
-                    "rank": str((page_num - 1) * page_size + index),
-                    "song_name": song_name,
-                    "artist": artist,
-                    "chart_metric": "",
-                    "duration": seconds_to_duration(item.get("timeLen")),
-                    "song_id": str(item.get("Hash", "")),
-                    "album_id": str(item.get("album_id", "")),
-                    "source_url": page_url,
-                }
-            )
-        time.sleep(0.2)
-
-    return rows[:total]
-
-
-def snapshot_key(scheduled_at: str, source: ChartSource) -> str:
-    compact = scheduled_at.replace("-", "").replace(":", "").replace("+08:00", "")
-    compact = compact.replace("T", "_")
-    return f"{compact}_{source.platform}_{source.chart}"
 
 
 def read_csv(path: Path, fields: list[str]) -> list[dict]:
@@ -324,38 +201,197 @@ def write_csv(path: Path, fields: list[str], rows: Iterable[dict]) -> None:
             writer.writerow({field: row.get(field, "") for field in fields})
 
 
-def append_dedup_rows(new_rows: list[dict]) -> None:
-    existing = read_csv(ROWS_CSV, ROW_FIELDS)
-    seen = {
-        (
-            row["scheduled_at"],
-            row["platform"],
-            row["chart"],
-            row["rank"],
-            row["song_id"],
-        )
+def append_csv(path: Path, fields: list[str], rows: list[dict]) -> None:
+    existing = read_csv(path, fields)
+    write_csv(path, fields, [*existing, *rows])
+
+
+def upsert_daily_status(status_row: dict) -> None:
+    existing = read_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS)
+    remaining = [
+        row
         for row in existing
+        if row.get("snapshot_date") != status_row.get("snapshot_date")
+    ]
+    write_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS, [*remaining, status_row])
+
+
+def is_day_complete(snapshot_date: str) -> bool:
+    expected = OUTPUT_DIR / f"music_charts_{snapshot_date}.xlsx"
+    for row in read_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS):
+        if (
+            row.get("snapshot_date") == snapshot_date
+            and row.get("status") == "complete"
+            and expected.exists()
+        ):
+            return True
+    return False
+
+
+def completed_dates() -> set[str]:
+    return {
+        row["snapshot_date"]
+        for row in read_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS)
+        if row.get("status") == "complete"
     }
 
-    merged = list(existing)
-    for row in new_rows:
-        key = (
-            row["scheduled_at"],
-            row["platform"],
-            row["chart"],
-            row["rank"],
-            row["song_id"],
+
+def qq_api_url(top_id: str) -> str:
+    payload = {
+        "detail": {
+            "module": "musicToplist.ToplistInfoServer",
+            "method": "GetDetail",
+            "param": {
+                "topId": int(top_id),
+                "offset": 0,
+                "num": 100,
+                "period": "",
+            },
+        }
+    }
+    encoded = urllib.parse.quote(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    )
+    return f"https://u.y.qq.com/cgi-bin/musicu.fcg?data={encoded}"
+
+
+def qq_metric(rank_type: int | None, rank_value: str) -> str:
+    if rank_type == 1:
+        return f"上升 {rank_value}".strip()
+    if rank_type == 2:
+        return f"下降 {rank_value}".strip()
+    if rank_type == 4:
+        return "新进"
+    if rank_type == 6:
+        return f"热度 {rank_value}".strip()
+    return rank_value
+
+
+def collect_qq(source: ChartSource, snapshot_date: str, captured_at: str) -> list[dict]:
+    payload = json.loads(fetch_text(qq_api_url(source.rank_id)))
+    detail = payload.get("detail", {}).get("data", {}).get("data", {})
+    songs = detail.get("song") or []
+    platform_date = str(detail.get("updateTime") or detail.get("period") or "")
+
+    if len(songs) < source.expected_rows:
+        raise RuntimeError(
+            f"{source.platform}{source.chart}只返回 {len(songs)} 条，少于预期 {source.expected_rows} 条"
         )
-        if key not in seen:
-            merged.append(row)
-            seen.add(key)
 
-    write_csv(ROWS_CSV, ROW_FIELDS, merged)
+    rows = []
+    for item in songs[: source.expected_rows]:
+        rows.append(
+            {
+                "snapshot_date": snapshot_date,
+                "captured_at": captured_at,
+                "platform": source.platform,
+                "chart": source.chart,
+                "official_chart": source.official_chart,
+                "platform_date": platform_date,
+                "rank": str(item.get("rank", "")),
+                "song_name": html.unescape(str(item.get("title", ""))).strip(),
+                "artist": html.unescape(str(item.get("singerName", ""))).strip(),
+                "chart_metric": qq_metric(
+                    item.get("rankType"), str(item.get("rankValue", ""))
+                ),
+                "duration": "",
+                "song_id": str(item.get("songId", "")),
+                "album_id": str(item.get("albumMid", "")),
+                "source_url": source.url,
+            }
+        )
+    return rows
 
 
-def append_heartbeats(new_rows: list[dict]) -> None:
-    existing = read_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS)
-    write_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, [*existing, *new_rows])
+def kugou_page_url(rank_id: str, page_num: int) -> str:
+    return f"https://www.kugou.com/yy/rank/home/{page_num}-{rank_id}.html?from=rank"
+
+
+def extract_kugou_platform_date(page: str) -> str:
+    match = re.search(r"榜单更新于：([0-9-]+)", page)
+    return match.group(1) if match else ""
+
+
+def extract_kugou_features(page: str) -> list[dict]:
+    match = re.search(r"global\.features\s*=\s*(\[.*?\]);", page, re.S)
+    if not match:
+        raise RuntimeError("未找到酷狗 global.features 数据")
+    return json.loads(match.group(1))
+
+
+def extract_kugou_page_info(page: str) -> tuple[int, int]:
+    total_match = re.search(r"total:\s*'([0-9]+)'", page)
+    page_size_match = re.search(r"pagesize:\s*'([0-9]+)'", page)
+    if not total_match or not page_size_match:
+        raise RuntimeError("未找到酷狗分页信息")
+    return int(total_match.group(1)), int(page_size_match.group(1))
+
+
+def split_kugou_name(file_name: str, fallback_artist: str) -> tuple[str, str]:
+    decoded = html.unescape(file_name).strip()
+    if " - " not in decoded:
+        return html.unescape(fallback_artist).strip(), decoded
+    artist, title = decoded.split(" - ", 1)
+    return artist.strip(), title.strip()
+
+
+def seconds_to_duration(value: object) -> str:
+    try:
+        seconds = int(round(float(value)))
+    except (TypeError, ValueError):
+        return ""
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def collect_kugou(source: ChartSource, snapshot_date: str, captured_at: str) -> list[dict]:
+    first_page = fetch_text(source.url)
+    platform_date = extract_kugou_platform_date(first_page)
+    total, page_size = extract_kugou_page_info(first_page)
+    page_count = max(1, math.ceil(total / page_size))
+    rows: list[dict] = []
+
+    for page_num in range(1, page_count + 1):
+        page_url = kugou_page_url(source.rank_id, page_num)
+        page = first_page if page_num == 1 else fetch_text(page_url)
+        for index, item in enumerate(extract_kugou_features(page), start=1):
+            artist, song_name = split_kugou_name(
+                str(item.get("FileName", "")),
+                str(item.get("author_name", "")),
+            )
+            rows.append(
+                {
+                    "snapshot_date": snapshot_date,
+                    "captured_at": captured_at,
+                    "platform": source.platform,
+                    "chart": source.chart,
+                    "official_chart": source.official_chart,
+                    "platform_date": platform_date,
+                    "rank": str((page_num - 1) * page_size + index),
+                    "song_name": song_name,
+                    "artist": artist,
+                    "chart_metric": "",
+                    "duration": seconds_to_duration(item.get("timeLen")),
+                    "song_id": str(item.get("Hash", "")),
+                    "album_id": str(item.get("album_id", "")),
+                    "source_url": page_url,
+                }
+            )
+        time.sleep(0.2)
+
+    rows = rows[:total]
+    if len(rows) < source.expected_rows:
+        raise RuntimeError(
+            f"{source.platform}{source.chart}只返回 {len(rows)} 条，少于预期 {source.expected_rows} 条"
+        )
+    return rows[: source.expected_rows]
+
+
+def collect_chart(source: ChartSource, snapshot_date: str, captured_at: str) -> list[dict]:
+    if source.kind == "qq":
+        return collect_qq(source, snapshot_date, captured_at)
+    if source.kind == "kugou":
+        return collect_kugou(source, snapshot_date, captured_at)
+    raise RuntimeError(f"未知榜单类型：{source.kind}")
 
 
 def col_name(index: int) -> str:
@@ -371,24 +407,30 @@ def xml_text(value: object) -> str:
     return escape(str(value), {'"': "&quot;"})
 
 
+def cell_style(row_index: int) -> int:
+    if row_index == 1:
+        return 1
+    if row_index == 2:
+        return 2
+    if row_index == 4:
+        return 3
+    return 0
+
+
 def sheet_xml(
     rows: list[list[object]],
-    widths: list[int] | None = None,
+    widths: list[int],
     freeze_rows: int = 0,
     autofilter_row: int | None = None,
 ) -> str:
-    widths = widths or []
     max_col = max((len(row) for row in rows), default=1)
     max_row = len(rows)
     dimension = f"A1:{col_name(max_col - 1)}{max_row}"
 
-    col_xml = ""
-    if widths:
-        parts = ["<cols>"]
-        for i, width in enumerate(widths, start=1):
-            parts.append(f'<col min="{i}" max="{i}" width="{width}" customWidth="1"/>')
-        parts.append("</cols>")
-        col_xml = "".join(parts)
+    col_parts = ["<cols>"]
+    for i, width in enumerate(widths, start=1):
+        col_parts.append(f'<col min="{i}" max="{i}" width="{width}" customWidth="1"/>')
+    col_parts.append("</cols>")
 
     views = '<sheetViews><sheetView workbookViewId="0" showGridLines="0">'
     if freeze_rows:
@@ -398,9 +440,9 @@ def sheet_xml(
         )
     views += "</sheetView></sheetViews>"
 
-    row_xml_parts = ["<sheetData>"]
+    sheet_data = ["<sheetData>"]
     for row_index, row in enumerate(rows, start=1):
-        row_xml_parts.append(f'<row r="{row_index}">')
+        sheet_data.append(f'<row r="{row_index}">')
         for col_index, value in enumerate(row):
             if value is None or value == "":
                 continue
@@ -408,15 +450,13 @@ def sheet_xml(
             style_id = cell_style(row_index)
             style_attr = f' s="{style_id}"' if style_id else ""
             if isinstance(value, (int, float)) and not isinstance(value, bool):
-                row_xml_parts.append(
-                    f'<c r="{cell_ref}"{style_attr}><v>{value}</v></c>'
-                )
+                sheet_data.append(f'<c r="{cell_ref}"{style_attr}><v>{value}</v></c>')
             else:
-                row_xml_parts.append(
+                sheet_data.append(
                     f'<c r="{cell_ref}" t="inlineStr"{style_attr}><is><t>{xml_text(value)}</t></is></c>'
                 )
-        row_xml_parts.append("</row>")
-    row_xml_parts.append("</sheetData>")
+        sheet_data.append("</row>")
+    sheet_data.append("</sheetData>")
 
     filter_xml = ""
     if autofilter_row and max_row >= autofilter_row:
@@ -427,21 +467,11 @@ def sheet_xml(
         '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
         f'<dimension ref="{dimension}"/>'
         f"{views}"
-        f"{col_xml}"
-        f"{''.join(row_xml_parts)}"
+        f"{''.join(col_parts)}"
+        f"{''.join(sheet_data)}"
         f"{filter_xml}"
         "</worksheet>"
     )
-
-
-def cell_style(row_index: int) -> int:
-    if row_index == 1:
-        return 1
-    if row_index == 2:
-        return 2
-    if row_index == 4:
-        return 3
-    return 0
 
 
 def workbook_xml(sheet_names: list[str]) -> str:
@@ -492,9 +522,9 @@ def root_rels_xml() -> str:
 
 
 def content_types_xml(sheet_count: int) -> str:
-    sheets = []
+    sheet_parts = []
     for index in range(1, sheet_count + 1):
-        sheets.append(
+        sheet_parts.append(
             '<Override '
             f'PartName="/xl/worksheets/sheet{index}.xml" '
             'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
@@ -508,7 +538,7 @@ def content_types_xml(sheet_count: int) -> str:
         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
         '<Override PartName="/xl/styles.xml" '
         'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>'
-        f"{''.join(sheets)}"
+        f"{''.join(sheet_parts)}"
         "</Types>"
     )
 
@@ -517,19 +547,19 @@ def styles_xml() -> str:
     return (
         '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
         '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        "<fonts count=\"4\">"
+        '<fonts count="4">'
         '<font><sz val="11"/><name val="Calibri"/></font>'
         '<font><b/><sz val="16"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
         '<font><sz val="10"/><color rgb="FF17324D"/><name val="Calibri"/></font>'
         '<font><b/><sz val="11"/><color rgb="FFFFFFFF"/><name val="Calibri"/></font>'
         "</fonts>"
-        "<fills count=\"4\">"
+        '<fills count="4">'
         '<fill><patternFill patternType="none"/></fill>'
         '<fill><patternFill patternType="gray125"/></fill>'
         '<fill><patternFill patternType="solid"><fgColor rgb="FF17324D"/></patternFill></fill>'
         '<fill><patternFill patternType="solid"><fgColor rgb="FF2B5C8A"/></patternFill></fill>'
         "</fills>"
-        "<borders count=\"2\">"
+        '<borders count="2">'
         "<border><left/><right/><top/><bottom/><diagonal/></border>"
         '<border><left style="thin"><color rgb="FFD7DEE8"/></left>'
         '<right style="thin"><color rgb="FFD7DEE8"/></right>'
@@ -548,10 +578,13 @@ def styles_xml() -> str:
     )
 
 
-def write_xlsx(sheet_map: dict[str, tuple[list[list[object]], list[int], int, int | None]]) -> None:
+def write_xlsx(
+    output_path: Path,
+    sheet_map: dict[str, tuple[list[list[object]], list[int], int, int | None]],
+) -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     names = list(sheet_map.keys())
-    with zipfile.ZipFile(WORKBOOK_PATH, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+    with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("[Content_Types].xml", content_types_xml(len(names)))
         archive.writestr("_rels/.rels", root_rels_xml())
         archive.writestr("xl/workbook.xml", workbook_xml(names))
@@ -561,16 +594,22 @@ def write_xlsx(sheet_map: dict[str, tuple[list[list[object]], list[int], int, in
             rows, widths, freeze_rows, autofilter_row = sheet_map[name]
             archive.writestr(
                 f"xl/worksheets/sheet{index}.xml",
-                sheet_xml(rows, widths=widths, freeze_rows=freeze_rows, autofilter_row=autofilter_row),
+                sheet_xml(rows, widths, freeze_rows, autofilter_row),
             )
 
 
-def chart_display_rows(rows: list[dict]) -> list[list[object]]:
+def with_title(title: str, subtitle: str, headers: list[str], body: list[list[object]]) -> list[list[object]]:
+    return [[title], [subtitle], [], headers, *body]
+
+
+def detail_table(rows: list[dict]) -> list[list[object]]:
     headers = [
+        "快照日期",
         "抓取时间",
         "平台",
         "榜单",
         "实际来源榜单",
+        "平台显示日期",
         "排名",
         "歌曲名",
         "歌手",
@@ -578,82 +617,68 @@ def chart_display_rows(rows: list[dict]) -> list[list[object]]:
         "时长",
         "歌曲/Hash ID",
         "专辑ID/MID",
-        "平台显示日期",
         "来源链接",
     ]
-    body = [
-        [
-            row["captured_at"],
-            row["platform"],
-            row["chart"],
-            row["official_chart"],
-            int(row["rank"]) if str(row["rank"]).isdigit() else row["rank"],
-            row["song_name"],
-            row["artist"],
-            row["chart_metric"],
-            row["duration"],
-            row["song_id"],
-            row["album_id"],
-            row["platform_date"],
-            row["source_url"],
-        ]
-        for row in rows
-    ]
-    return body_with_title("榜单明细", "每一行是一首歌在某一次每小时快照中的排名。", headers, body)
+    body = []
+    for row in rows:
+        body.append(
+            [
+                row["snapshot_date"],
+                row["captured_at"],
+                row["platform"],
+                row["chart"],
+                row["official_chart"],
+                row["platform_date"],
+                int(row["rank"]) if str(row["rank"]).isdigit() else row["rank"],
+                row["song_name"],
+                row["artist"],
+                row["chart_metric"],
+                row["duration"],
+                row["song_id"],
+                row["album_id"],
+                row["source_url"],
+            ]
+        )
+    return with_title(
+        "榜单明细",
+        "本表是一日快照：一行代表一首歌在该日对应平台榜单里的排名。",
+        headers,
+        body,
+    )
 
 
-def body_with_title(
-    title: str,
-    subtitle: str,
-    headers: list[str],
-    body: list[list[object]],
-) -> list[list[object]]:
-    return [[title], [subtitle], [], headers, *body]
-
-
-def latest_rows_by_chart(all_rows: list[dict], source: ChartSource) -> list[dict]:
-    matched = [
+def rows_for_chart(rows: list[dict], source: ChartSource) -> list[dict]:
+    return [
         row
-        for row in all_rows
+        for row in rows
         if row["platform"] == source.platform and row["chart"] == source.chart
     ]
-    if not matched:
-        return []
-    latest = max(row["scheduled_at"] for row in matched)
-    return [row for row in matched if row["scheduled_at"] == latest]
 
 
-def build_workbook(config: dict) -> None:
-    all_rows = read_csv(ROWS_CSV, ROW_FIELDS)
-    heartbeats = read_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS)
-
+def build_daily_workbook(snapshot_date: str, captured_at: str, rows: list[dict]) -> Path:
+    output_path = OUTPUT_DIR / f"music_charts_{snapshot_date}.xlsx"
     summary_headers = ["项目", "内容"]
-    latest_scheduled_at = max((row["scheduled_at"] for row in all_rows), default="")
     summary_body = [
-        ["首次运行", config.get("started_at", "")],
-        ["自动停止时间", config.get("ends_at", "")],
-        ["最近快照小时", latest_scheduled_at],
-        ["总明细行数", len(all_rows)],
-        ["心跳记录数", len(heartbeats)],
-        ["输出文件", str(WORKBOOK_PATH.as_posix())],
+        ["快照日期", snapshot_date],
+        ["抓取时间", captured_at],
+        ["总行数", len(rows)],
+        ["输出文件", str(output_path.as_posix())],
+        ["说明", "每天多次候补触发，但同一日期只生成一张完整xlsx表格。"],
     ]
     for source in CHARTS:
-        latest_count = len(latest_rows_by_chart(all_rows, source))
+        count = len(rows_for_chart(rows, source))
         summary_body.append(
             [
                 f"{source.platform} {source.chart}",
-                f"最近一次 {latest_count} 行；来源口径：{source.official_chart}；{source.note}",
+                f"{count} 行；来源口径：{source.official_chart}；{source.note}",
             ]
         )
 
-    heartbeat_headers = HEARTBEAT_FIELDS
-    heartbeat_body = [[row[field] for field in HEARTBEAT_FIELDS] for row in heartbeats]
-
     sheet_map: dict[str, tuple[list[list[object]], list[int], int, int | None]] = {
         "说明": (
-            body_with_title(
-                "音乐榜单心跳任务",
-                "自动抓取 QQ音乐、酷狗音乐热歌榜/飙升榜，并保留每小时历史快照。",
+            with_title(
+                "音乐榜单每日快照",
+                "QQ音乐热歌/飙升、酷狗热歌/飙升，每天一张表。",
                 summary_headers,
                 summary_body,
             ),
@@ -661,61 +686,71 @@ def build_workbook(config: dict) -> None:
             4,
             4,
         ),
-        "运行心跳": (
-            body_with_title(
-                "运行心跳",
-                "每个榜单每次运行一行，status=success 表示该榜单本小时抓取成功。",
-                heartbeat_headers,
-                heartbeat_body,
-            ),
-            [24, 24, 14, 14, 16, 12, 10, 24, 24, 80],
-            4,
-            4,
-        ),
         "全部明细": (
-            chart_display_rows(all_rows),
-            [24, 12, 12, 16, 8, 28, 26, 14, 10, 34, 18, 16, 58],
+            detail_table(rows),
+            [13, 24, 12, 12, 16, 16, 8, 28, 28, 14, 10, 34, 18, 58],
             4,
             4,
         ),
     }
 
     for source in CHARTS:
-        rows = latest_rows_by_chart(all_rows, source)
-        sheet_name = f"{source.platform}-{source.chart}"
-        sheet_map[sheet_name] = (
-            chart_display_rows(rows),
-            [24, 12, 12, 16, 8, 28, 26, 14, 10, 34, 18, 16, 58],
+        chart_rows = rows_for_chart(rows, source)
+        sheet_map[f"{source.platform}-{source.chart}"] = (
+            detail_table(chart_rows),
+            [13, 24, 12, 12, 16, 16, 8, 28, 28, 14, 10, 34, 18, 58],
             4,
             4,
         )
 
-    write_xlsx(sheet_map)
+    write_xlsx(output_path, sheet_map)
+    return output_path
 
 
-def collect_one(source: ChartSource, scheduled_at: str, captured_at: str) -> list[dict]:
-    if source.kind == "qq":
-        return collect_qq(source, scheduled_at, captured_at)
-    if source.kind == "kugou":
-        return collect_kugou(source, scheduled_at, captured_at)
-    raise RuntimeError(f"未知榜单类型：{source.kind}")
+def write_run_status(config: dict, message: str) -> None:
+    statuses = read_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS)
+    complete = [row for row in statuses if row.get("status") == "complete"]
+    lines = [
+        "# 音乐榜单每日采集状态",
+        "",
+        f"- 状态：{message}",
+        f"- 目标天数：{config.get('target_days', TARGET_DAYS)}",
+        f"- 已完成天数：{len(complete)}",
+        f"- 首次运行日期：{config.get('started_on', '')}",
+        "",
+        "## 已生成表格",
+        "",
+    ]
+    if complete:
+        for row in sorted(complete, key=lambda item: item["snapshot_date"]):
+            lines.append(
+                f"- {row['snapshot_date']}: [{Path(row['xlsx_path']).name}]({row['xlsx_path']})"
+            )
+    else:
+        lines.append("- 暂无")
+    RUN_STATUS_MD.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def main() -> int:
     ensure_dirs()
     started = now_local()
-    config = load_or_create_config(started)
-    ends_at = datetime.fromisoformat(config["ends_at"])
-    if started >= ends_at:
-        print(f"任务已超过自动停止时间：{config['ends_at']}，本次不再抓取。")
+    today = started.date()
+    snapshot_date = today.isoformat()
+    captured_at = iso(started)
+    run_id = started.strftime("%Y%m%d_%H%M%S")
+    config = load_or_create_config(today)
+
+    if len(completed_dates()) >= int(config.get("target_days", TARGET_DAYS)):
+        write_run_status(config, "已完成7天采集，本次自动跳过。")
+        print("已完成目标天数，本次跳过。")
         return 0
 
-    scheduled = started.replace(minute=0, second=0, microsecond=0)
-    scheduled_at = iso(scheduled)
-    run_id = started.strftime("%Y%m%d_%H%M%S")
-    captured_at = iso(started)
+    if is_day_complete(snapshot_date):
+        write_run_status(config, f"{snapshot_date} 已经有完整表格，本次候补触发自动跳过。")
+        print(f"{snapshot_date} 已完成，本次跳过。")
+        return 0
 
-    all_new_rows: list[dict] = []
+    all_rows: list[dict] = []
     heartbeats: list[dict] = []
 
     for source in CHARTS:
@@ -724,8 +759,8 @@ def main() -> int:
         rows: list[dict] = []
         error = ""
         try:
-            rows = collect_one(source, scheduled_at, captured_at)
-            all_new_rows.extend(rows)
+            rows = collect_chart(source, snapshot_date, captured_at)
+            all_rows.extend(rows)
         except Exception as exc:
             status = "failed"
             error = str(exc)[:500]
@@ -734,11 +769,11 @@ def main() -> int:
             heartbeats.append(
                 {
                     "run_id": run_id,
-                    "scheduled_at": scheduled_at,
+                    "snapshot_date": snapshot_date,
+                    "status": status,
                     "platform": source.platform,
                     "chart": source.chart,
                     "official_chart": source.official_chart,
-                    "status": status,
                     "row_count": str(len(rows)),
                     "started_at": iso(chart_started),
                     "finished_at": iso(chart_finished),
@@ -746,15 +781,58 @@ def main() -> int:
                 }
             )
 
-    append_dedup_rows(all_new_rows)
-    append_heartbeats(heartbeats)
-    build_workbook(config)
-
+    append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
     success_count = sum(1 for row in heartbeats if row["status"] == "success")
-    print(
-        f"完成：{success_count}/{len(CHARTS)} 个榜单成功，"
-        f"新增候选明细 {len(all_new_rows)} 行，输出 {WORKBOOK_PATH}"
+
+    if success_count != len(CHARTS):
+        message = f"{snapshot_date} 本次只成功 {success_count}/{len(CHARTS)} 个榜单，等待后续候补触发重试。"
+        upsert_daily_status(
+            {
+                "snapshot_date": snapshot_date,
+                "status": "failed",
+                "row_count": str(len(all_rows)),
+                "xlsx_path": "",
+                "completed_at": "",
+                "message": message,
+            }
+        )
+        write_run_status(config, message)
+        print(message)
+        return 1
+
+    expected_total = sum(source.expected_rows for source in CHARTS)
+    if len(all_rows) != expected_total:
+        message = f"{snapshot_date} 行数异常：实际 {len(all_rows)}，预期 {expected_total}。"
+        upsert_daily_status(
+            {
+                "snapshot_date": snapshot_date,
+                "status": "failed",
+                "row_count": str(len(all_rows)),
+                "xlsx_path": "",
+                "completed_at": "",
+                "message": message,
+            }
+        )
+        write_run_status(config, message)
+        print(message)
+        return 1
+
+    detail_csv = DATA_DIR / f"daily_rows_{snapshot_date}.csv"
+    write_csv(detail_csv, DETAIL_FIELDS, all_rows)
+    output_path = build_daily_workbook(snapshot_date, captured_at, all_rows)
+    message = f"{snapshot_date} 完成，生成 {output_path.name}，共 {len(all_rows)} 行。"
+    upsert_daily_status(
+        {
+            "snapshot_date": snapshot_date,
+            "status": "complete",
+            "row_count": str(len(all_rows)),
+            "xlsx_path": output_path.as_posix(),
+            "completed_at": captured_at,
+            "message": message,
+        }
     )
+    write_run_status(config, message)
+    print(message)
     return 0
 
 
