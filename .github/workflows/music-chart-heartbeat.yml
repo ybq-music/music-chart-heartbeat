@@ -1,20 +1,21 @@
-name: Music Chart Heartbeat
+name: Music Chart Daily
 
 on:
   workflow_dispatch:
   schedule:
-    # GitHub cron uses UTC. Minute 17 avoids the busiest exact-hour window.
-    - cron: "17 * * * *"
+    # UTC time. These are Beijing time 10:17, 14:17, 18:17, 22:17.
+    # Multiple attempts reduce the chance of missing a daily snapshot.
+    - cron: "17 2,6,10,14 * * *"
 
 permissions:
   contents: write
 
 concurrency:
-  group: music-chart-heartbeat
+  group: music-chart-daily
   cancel-in-progress: false
 
 env:
-  RUN_DAYS: "7"
+  TARGET_DAYS: "7"
 
 jobs:
   collect:
@@ -22,27 +23,36 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
-      - name: Collect music charts
+      - name: Collect daily music charts
+        id: collect
+        continue-on-error: true
         run: python scripts/collect_music_charts.py
 
       - name: Commit updated data
+        if: always()
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add data outputs
+          if [ -d data ]; then git add data; fi
+          if [ -d outputs ]; then git add outputs; fi
+          if [ -f RUN_STATUS.md ]; then git add RUN_STATUS.md; fi
           if git diff --cached --quiet; then
             echo "No data changes to commit."
           else
-            git commit -m "chore: hourly music chart snapshot"
+            git commit -m "chore: daily music chart snapshot"
             git pull --rebase
             git push
           fi
+
+      - name: Mark workflow failed when collection failed
+        if: steps.collect.outcome != 'success'
+        run: exit 1
