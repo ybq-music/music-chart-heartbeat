@@ -3,9 +3,20 @@ name: Music Chart Daily
 on:
   workflow_dispatch:
   schedule:
-    # UTC time. These are Beijing time 10:17, 14:17, 18:17, 22:17.
-    # Multiple attempts reduce the chance of missing a daily snapshot.
-    - cron: "17 2,6,10,14 * * *"
+    # UTC time. These are Beijing time:
+    # 00:53, 06:37, 08:19, 10:43, 12:07,
+    # 14:38, 16:49, 18:13, 20:57, 22:21.
+    # These avoid the common :00, :15, :30, :45 windows; duplicate official dates are skipped.
+    - cron: "53 16 * * *"
+    - cron: "37 22 * * *"
+    - cron: "19 0 * * *"
+    - cron: "43 2 * * *"
+    - cron: "7 4 * * *"
+    - cron: "38 6 * * *"
+    - cron: "49 8 * * *"
+    - cron: "13 10 * * *"
+    - cron: "57 12 * * *"
+    - cron: "21 14 * * *"
 
 permissions:
   contents: write
