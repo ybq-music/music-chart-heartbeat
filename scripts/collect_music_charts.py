@@ -11,6 +11,7 @@ import time
 import urllib.parse
 import urllib.request
 import zipfile
+import xml.etree.ElementTree as ET
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -83,6 +84,8 @@ class ChartSource:
     rank_id: str
     expected_rows: int
     note: str
+    minimum_rows: int = 0
+    variable_rows: bool = False
 
 
 CHARTS = [
@@ -126,6 +129,28 @@ CHARTS = [
         url="https://www.kugou.com/yy/rank/home/1-6666.html?from=rank",
         note="酷狗飙升榜，按公开榜单分页抓取。",
     ),
+    ChartSource(
+        platform="微博",
+        chart="热搜榜",
+        official_chart="微博热搜榜",
+        kind="weibo_hot",
+        rank_id="",
+        expected_rows=50,
+        url="https://weibo.com/ajax/statuses/hot_band",
+        note="微博公开热搜JSON，剔除广告位后取前50名。",
+    ),
+    ChartSource(
+        platform="微博",
+        chart="文娱热搜榜",
+        official_chart="微博热搜榜-文娱条目",
+        kind="weibo_entertainment",
+        rank_id="",
+        expected_rows=50,
+        minimum_rows=1,
+        variable_rows=True,
+        url="https://weibo.com/ajax/statuses/hot_band",
+        note="从微博热搜JSON中提取Entertainment/艺人/剧集/电影/综艺/音乐等文娱条目，数量随当日榜单浮动。",
+    ),
 ]
 
 
@@ -160,12 +185,21 @@ def load_or_create_config(today: date) -> dict:
     return config
 
 
+def request_referer(url: str) -> str:
+    if "weibo.com" in url:
+        return "https://weibo.com/"
+    if "kugou.com" in url:
+        return "https://www.kugou.com/"
+    return "https://y.qq.com/"
+
+
 def fetch_text(url: str) -> str:
     request = urllib.request.Request(
         url,
         headers={
+            "Accept": "application/json,text/plain,text/html,*/*",
             "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Referer": "https://y.qq.com/",
+            "Referer": request_referer(url),
             "User-Agent": (
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
@@ -217,6 +251,27 @@ def upsert_daily_status(status_row: dict) -> None:
     write_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS, [*remaining, status_row])
 
 
+def expected_sheet_names() -> set[str]:
+    return {"说明", "全部明细", *{f"{source.platform}-{source.chart}" for source in CHARTS}}
+
+
+def workbook_has_expected_sheets(path: Path) -> bool:
+    try:
+        with zipfile.ZipFile(path) as workbook:
+            root = ET.fromstring(workbook.read("xl/workbook.xml"))
+        ns = {"a": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        sheets_node = root.find("a:sheets", ns)
+        if sheets_node is None:
+            return False
+        sheet_names = {
+            sheet.attrib.get("name", "")
+            for sheet in sheets_node
+        }
+        return expected_sheet_names().issubset(sheet_names)
+    except Exception:
+        return False
+
+
 def is_day_complete(snapshot_date: str) -> bool:
     expected = OUTPUT_DIR / f"music_charts_{snapshot_date}.xlsx"
     for row in read_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS):
@@ -224,6 +279,7 @@ def is_day_complete(snapshot_date: str) -> bool:
             row.get("snapshot_date") == snapshot_date
             and row.get("status") == "complete"
             and expected.exists()
+            and workbook_has_expected_sheets(expected)
         ):
             return True
     return False
@@ -387,11 +443,114 @@ def collect_kugou(source: ChartSource, snapshot_date: str, captured_at: str) -> 
     return rows[: source.expected_rows]
 
 
+ENTERTAINMENT_CATEGORIES = {
+    "艺人",
+    "剧集",
+    "电影",
+    "综艺",
+    "音乐",
+    "演出",
+    "盛典",
+    "动漫",
+}
+
+
+def weibo_search_url(word: str) -> str:
+    query = f"#{word}#"
+    return "https://s.weibo.com/weibo?q=" + urllib.parse.quote(query)
+
+
+def fetch_weibo_band_items(source: ChartSource) -> list[dict]:
+    payload = json.loads(fetch_text(source.url))
+    if payload.get("ok") != 1:
+        raise RuntimeError(f"微博接口返回异常：{payload.get('ok')}")
+    items = payload.get("data", {}).get("band_list") or []
+    clean_items = []
+    for item in items:
+        if item.get("is_ad"):
+            continue
+        if not item.get("realpos"):
+            continue
+        word = str(item.get("word") or item.get("note") or "").strip()
+        if not word:
+            continue
+        clean_items.append(item)
+    clean_items.sort(key=lambda item: int(item.get("realpos") or 9999))
+    return clean_items
+
+
+def is_weibo_entertainment_item(item: dict) -> bool:
+    category = str(item.get("category") or "").strip()
+    channel_type = str(item.get("channel_type") or "").strip()
+    return channel_type == "Entertainment" or category in ENTERTAINMENT_CATEGORIES
+
+
+def weibo_metric(item: dict, total_rank: str | None = None) -> str:
+    parts = []
+    if total_rank:
+        parts.append(f"总榜排名 {total_rank}")
+    if item.get("num") not in (None, ""):
+        parts.append(f"热度 {item.get('num')}")
+    label = str(item.get("icon_desc") or item.get("label_name") or "").strip()
+    if label:
+        parts.append(label)
+    field_tag = str(item.get("field_tag") or "").strip()
+    if field_tag:
+        parts.append(field_tag)
+    return "；".join(parts)
+
+
+def collect_weibo(source: ChartSource, snapshot_date: str, captured_at: str) -> list[dict]:
+    items = fetch_weibo_band_items(source)
+    if source.kind == "weibo_hot":
+        selected = items[: source.expected_rows]
+    else:
+        selected = [item for item in items if is_weibo_entertainment_item(item)]
+        selected = selected[: source.expected_rows]
+
+    minimum_rows = source.minimum_rows or source.expected_rows
+    if len(selected) < minimum_rows:
+        raise RuntimeError(
+            f"{source.platform}{source.chart}只返回 {len(selected)} 条，少于最低预期 {minimum_rows} 条"
+        )
+
+    rows = []
+    for index, item in enumerate(selected, start=1):
+        word = html.unescape(str(item.get("word") or item.get("note") or "")).strip()
+        category = html.unescape(str(item.get("category") or "")).strip()
+        total_rank = str(item.get("realpos") or "")
+        rank = total_rank if source.kind == "weibo_hot" else str(index)
+        rows.append(
+            {
+                "snapshot_date": snapshot_date,
+                "captured_at": captured_at,
+                "platform": source.platform,
+                "chart": source.chart,
+                "official_chart": source.official_chart,
+                "platform_date": "",
+                "rank": rank,
+                "song_name": word,
+                "artist": category,
+                "chart_metric": weibo_metric(
+                    item,
+                    total_rank if source.kind == "weibo_entertainment" else None,
+                ),
+                "duration": "",
+                "song_id": word,
+                "album_id": str(item.get("subject_label") or item.get("star_name") or ""),
+                "source_url": weibo_search_url(word),
+            }
+        )
+    return rows
+
+
 def collect_chart(source: ChartSource, snapshot_date: str, captured_at: str) -> list[dict]:
     if source.kind == "qq":
         return collect_qq(source, snapshot_date, captured_at)
     if source.kind == "kugou":
         return collect_kugou(source, snapshot_date, captured_at)
+    if source.kind in {"weibo_hot", "weibo_entertainment"}:
+        return collect_weibo(source, snapshot_date, captured_at)
     raise RuntimeError(f"未知榜单类型：{source.kind}")
 
 
@@ -412,12 +571,16 @@ def official_snapshot_date(rows: list[dict], fallback_date: str) -> str:
     parts = []
     for (platform, chart), date_values in sorted(dates_by_chart.items()):
         parts.append(f"{platform}-{chart}: {', '.join(sorted(date_values))}")
-    raise RuntimeError("四个榜单的平台显示日期不一致，等待后续候补触发重试：" + "；".join(parts))
+    raise RuntimeError("每日更新榜单的平台显示日期不一致，等待后续候补触发重试：" + "；".join(parts))
 
 
 def replace_snapshot_date(rows: list[dict], snapshot_date: str) -> None:
     for row in rows:
         row["snapshot_date"] = snapshot_date
+
+
+def minimum_expected_rows(source: ChartSource) -> int:
+    return source.minimum_rows or source.expected_rows
 
 
 def col_name(index: int) -> str:
@@ -637,12 +800,12 @@ def detail_table(rows: list[dict]) -> list[list[object]]:
         "实际来源榜单",
         "平台显示日期",
         "排名",
-        "歌曲名",
-        "歌手",
-        "榜单指标",
+        "条目/歌曲名",
+        "歌手/分类",
+        "指标/热度",
         "时长",
-        "歌曲/Hash ID",
-        "专辑ID/MID",
+        "歌曲/Hash/词条ID",
+        "专辑ID/MID/扩展",
         "来源链接",
     ]
     body = []
@@ -667,7 +830,7 @@ def detail_table(rows: list[dict]) -> list[list[object]]:
         )
     return with_title(
         "榜单明细",
-        "本表是一日快照：一行代表一首歌在该日对应平台榜单里的排名。",
+        "本表是一日快照：一行代表一个榜单条目在该日对应平台榜单里的排名。",
         headers,
         body,
     )
@@ -689,7 +852,7 @@ def build_daily_workbook(snapshot_date: str, captured_at: str, rows: list[dict])
         ["抓取时间", captured_at],
         ["总行数", len(rows)],
         ["输出文件", str(output_path.as_posix())],
-        ["说明", "每天多次候补触发，但同一日期只生成一张完整xlsx表格。"],
+        ["说明", "每天多次候补触发，但同一日期只生成一张完整xlsx表格。微博热搜为实时榜，按采集时间记录。"],
     ]
     for source in CHARTS:
         count = len(rows_for_chart(rows, source))
@@ -703,8 +866,8 @@ def build_daily_workbook(snapshot_date: str, captured_at: str, rows: list[dict])
     sheet_map: dict[str, tuple[list[list[object]], list[int], int, int | None]] = {
         "说明": (
             with_title(
-                "音乐榜单每日快照",
-                "QQ音乐热歌/飙升、酷狗热歌/飙升，每天一张表。",
+                "每日榜单快照",
+                "QQ音乐、酷狗音乐、微博热搜，每天一张表。",
                 summary_headers,
                 summary_body,
             ),
@@ -821,10 +984,10 @@ def main() -> int:
         print(message)
         return 1
 
-    expected_total = sum(source.expected_rows for source in CHARTS)
-    if len(all_rows) != expected_total:
+    expected_min_total = sum(minimum_expected_rows(source) for source in CHARTS)
+    if len(all_rows) < expected_min_total:
         append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
-        message = f"{snapshot_date} 行数异常：实际 {len(all_rows)}，预期 {expected_total}。"
+        message = f"{snapshot_date} 行数异常：实际 {len(all_rows)}，最低预期 {expected_min_total}。"
         upsert_daily_status(
             {
                 "snapshot_date": snapshot_date,
