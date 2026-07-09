@@ -32,6 +32,8 @@ RUN_STATUS_MD = ROOT / "RUN_STATUS.md"
 TZ = ZoneInfo("Asia/Shanghai")
 TARGET_DAYS = int(os.getenv("TARGET_DAYS", "7"))
 REQUEST_TIMEOUT_SECONDS = int(os.getenv("REQUEST_TIMEOUT_SECONDS", "30"))
+COLLECTION_SCHEMA = "music-weibo-v1"
+COLLECTION_START_ON = os.getenv("COLLECTION_START_ON", "").strip()
 
 
 DETAIL_FIELDS = [
@@ -170,12 +172,33 @@ def ensure_dirs() -> None:
 def load_or_create_config(today: date) -> dict:
     ensure_dirs()
     if CONFIG_PATH.exists():
-        return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        changed = False
+        configured_start = COLLECTION_START_ON or str(config.get("collection_start_on", "")).strip()
+        if not configured_start:
+            configured_start = today.isoformat()
+        updates = {
+            "collection_schema": COLLECTION_SCHEMA,
+            "collection_start_on": configured_start,
+            "target_days": TARGET_DAYS,
+        }
+        for key, value in updates.items():
+            if config.get(key) != value:
+                config[key] = value
+                changed = True
+        if changed:
+            CONFIG_PATH.write_text(
+                json.dumps(config, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        return config
 
     config = {
         "timezone": "Asia/Shanghai",
         "target_days": TARGET_DAYS,
         "started_on": today.isoformat(),
+        "collection_schema": COLLECTION_SCHEMA,
+        "collection_start_on": COLLECTION_START_ON or today.isoformat(),
         "created_at": iso(now_local()),
     }
     CONFIG_PATH.write_text(
@@ -285,12 +308,20 @@ def is_day_complete(snapshot_date: str) -> bool:
     return False
 
 
-def completed_dates() -> set[str]:
-    return {
-        row["snapshot_date"]
-        for row in read_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS)
-        if row.get("status") == "complete"
-    }
+def completed_dates(start_on: str = "") -> set[str]:
+    dates = set()
+    for row in read_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS):
+        snapshot_date = row.get("snapshot_date", "")
+        expected = OUTPUT_DIR / f"music_charts_{snapshot_date}.xlsx"
+        if (
+            snapshot_date
+            and row.get("status") == "complete"
+            and (not start_on or snapshot_date >= start_on)
+            and expected.exists()
+            and workbook_has_expected_sheets(expected)
+        ):
+            dates.add(snapshot_date)
+    return dates
 
 
 def qq_api_url(top_id: str) -> str:
@@ -898,11 +929,24 @@ def build_daily_workbook(snapshot_date: str, captured_at: str, rows: list[dict])
 
 def write_run_status(config: dict, message: str) -> None:
     statuses = read_csv(DAILY_STATUS_CSV, DAILY_STATUS_FIELDS)
-    complete = [row for row in statuses if row.get("status") == "complete"]
+    collection_start_on = str(config.get("collection_start_on", "")).strip()
+    complete = []
+    for row in statuses:
+        snapshot_date = row.get("snapshot_date", "")
+        expected = OUTPUT_DIR / f"music_charts_{snapshot_date}.xlsx"
+        if (
+            snapshot_date
+            and row.get("status") == "complete"
+            and (not collection_start_on or snapshot_date >= collection_start_on)
+            and expected.exists()
+            and workbook_has_expected_sheets(expected)
+        ):
+            complete.append(row)
     lines = [
         "# 音乐榜单每日采集状态",
         "",
         f"- 状态：{message}",
+        f"- 采集起始日期：{collection_start_on}",
         f"- 目标天数：{config.get('target_days', TARGET_DAYS)}",
         f"- 已完成天数：{len(complete)}",
         f"- 首次运行日期：{config.get('started_on', '')}",
@@ -928,8 +972,9 @@ def main() -> int:
     captured_at = iso(started)
     run_id = started.strftime("%Y%m%d_%H%M%S")
     config = load_or_create_config(today)
+    collection_start_on = str(config.get("collection_start_on", "")).strip()
 
-    if len(completed_dates()) >= int(config.get("target_days", TARGET_DAYS)):
+    if len(completed_dates(collection_start_on)) >= int(config.get("target_days", TARGET_DAYS)):
         write_run_status(config, "已完成7天采集，本次自动跳过。")
         print("已完成目标天数，本次跳过。")
         return 0
@@ -1020,6 +1065,14 @@ def main() -> int:
         write_run_status(config, message)
         print(message)
         return 1
+
+    if collection_start_on and snapshot_date < collection_start_on:
+        replace_snapshot_date(heartbeats, snapshot_date)
+        append_csv(HEARTBEAT_CSV, HEARTBEAT_FIELDS, heartbeats)
+        message = f"{snapshot_date} 早于采集起始日期 {collection_start_on}，本次自动跳过。"
+        write_run_status(config, message)
+        print(message)
+        return 0
 
     replace_snapshot_date(all_rows, snapshot_date)
     replace_snapshot_date(heartbeats, snapshot_date)
