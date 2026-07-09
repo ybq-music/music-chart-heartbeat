@@ -27,6 +27,7 @@ concurrency:
 
 env:
   TARGET_DAYS: "7"
+  COLLECTION_START_ON: "2026-07-09"
 
 jobs:
   collect:
