@@ -26,7 +26,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TARGET_DAYS: "7"
+  TARGET_DAYS: "0"
   COLLECTION_START_ON: "2026-07-09"
 
 jobs:
