@@ -324,6 +324,21 @@ def completed_dates(start_on: str = "") -> set[str]:
     return dates
 
 
+def configured_target_days(config: dict) -> int:
+    try:
+        return int(config.get("target_days", TARGET_DAYS))
+    except (TypeError, ValueError):
+        return TARGET_DAYS
+
+
+def has_day_limit(config: dict) -> bool:
+    return configured_target_days(config) > 0
+
+
+def target_days_text(config: dict) -> str:
+    return str(configured_target_days(config)) if has_day_limit(config) else "不限制"
+
+
 def qq_api_url(top_id: str) -> str:
     payload = {
         "detail": {
@@ -947,7 +962,7 @@ def write_run_status(config: dict, message: str) -> None:
         "",
         f"- 状态：{message}",
         f"- 采集起始日期：{collection_start_on}",
-        f"- 目标天数：{config.get('target_days', TARGET_DAYS)}",
+        f"- 目标天数：{target_days_text(config)}",
         f"- 已完成天数：{len(complete)}",
         f"- 首次运行日期：{config.get('started_on', '')}",
         "",
@@ -974,8 +989,8 @@ def main() -> int:
     config = load_or_create_config(today)
     collection_start_on = str(config.get("collection_start_on", "")).strip()
 
-    if len(completed_dates(collection_start_on)) >= int(config.get("target_days", TARGET_DAYS)):
-        write_run_status(config, "已完成7天采集，本次自动跳过。")
+    if has_day_limit(config) and len(completed_dates(collection_start_on)) >= configured_target_days(config):
+        write_run_status(config, f"已完成{configured_target_days(config)}天采集，本次自动跳过。")
         print("已完成目标天数，本次跳过。")
         return 0
 
