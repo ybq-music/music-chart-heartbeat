@@ -19,4 +19,4 @@
 2026-07-21,complete,866,/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-07-21.xlsx,2026-07-21T15:43:40+08:00,2026-07-21 完成，生成 music_charts_2026-07-21.xlsx，共 866 行。
 2026-07-22,complete,866,/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-07-22.xlsx,2026-07-22T15:44:03+08:00,2026-07-22 完成，生成 music_charts_2026-07-22.xlsx，共 866 行。
 2026-07-23,complete,873,/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-07-23.xlsx,2026-07-23T15:45:54+08:00,2026-07-23 完成，生成 music_charts_2026-07-23.xlsx，共 873 行。
-2026-07-24,failed,850,,,2026-07-24 本次只成功 5/6 个榜单，等待后续候补触发重试。
+2026-07-24,complete,867,/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-07-24.xlsx,2026-07-24T15:42:55+08:00,2026-07-24 完成，生成 music_charts_2026-07-24.xlsx，共 867 行。
