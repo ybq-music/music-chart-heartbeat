@@ -52,3 +52,4 @@
 2026-08-23,complete,874,/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-08-23.xlsx,2026-08-23T11:35:34+08:00,2026-08-23 完成，生成 music_charts_2026-08-23.xlsx，共 874 行。
 2026-08-24,complete,869,/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-08-24.xlsx,2026-08-24T11:38:08+08:00,2026-08-24 完成，生成 music_charts_2026-08-24.xlsx，共 869 行。
 2026-08-25,complete,866,/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-08-25.xlsx,2026-08-25T11:30:45+08:00,2026-08-25 完成，生成 music_charts_2026-08-25.xlsx，共 866 行。
+2026-08-26,failed,865,,,每日更新榜单的平台显示日期不一致，等待后续候补触发重试：QQ音乐-热歌榜: 2026-08-25；QQ音乐-飙升榜: 2026-08-25；酷狗音乐-热歌榜: 2026-08-25；酷狗音乐-飙升榜: 2026-08-26
