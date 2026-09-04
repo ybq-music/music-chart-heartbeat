@@ -1,9 +1,9 @@
 # 音乐榜单每日采集状态
 
-- 状态：2026-09-04 本次只成功 4/6 个榜单，等待后续候补触发重试。
+- 状态：2026-09-04 完成，生成 music_charts_2026-09-04.xlsx，共 869 行。
 - 采集起始日期：2026-07-09
 - 目标天数：不限制
-- 已完成天数：57
+- 已完成天数：58
 - 首次运行日期：2026-07-05
 
 ## 已生成表格
@@ -65,3 +65,4 @@
 - 2026-09-01: [music_charts_2026-09-01.xlsx](/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-09-01.xlsx)
 - 2026-09-02: [music_charts_2026-09-02.xlsx](/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-09-02.xlsx)
 - 2026-09-03: [music_charts_2026-09-03.xlsx](/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-09-03.xlsx)
+- 2026-09-04: [music_charts_2026-09-04.xlsx](/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-09-04.xlsx)
