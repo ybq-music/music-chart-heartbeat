@@ -1,9 +1,9 @@
 # 音乐榜单每日采集状态
 
-- 状态：每日更新榜单的平台显示日期不一致，等待后续候补触发重试：QQ音乐-热歌榜: 2026-11-21；QQ音乐-飙升榜: 2026-11-21；酷狗音乐-热歌榜: 2026-11-22；酷狗音乐-飙升榜: 2026-11-22
+- 状态：2026-11-22 完成，生成 music_charts_2026-11-22.xlsx，共 868 行。
 - 采集起始日期：2026-07-09
 - 目标天数：不限制
-- 已完成天数：136
+- 已完成天数：137
 - 首次运行日期：2026-07-05
 
 ## 已生成表格
@@ -144,3 +144,4 @@
 - 2026-11-19: [music_charts_2026-11-19.xlsx](/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-11-19.xlsx)
 - 2026-11-20: [music_charts_2026-11-20.xlsx](/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-11-20.xlsx)
 - 2026-11-21: [music_charts_2026-11-21.xlsx](/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-11-21.xlsx)
+- 2026-11-22: [music_charts_2026-11-22.xlsx](/home/runner/work/music-chart-heartbeat/music-chart-heartbeat/outputs/music_charts_2026-11-22.xlsx)
